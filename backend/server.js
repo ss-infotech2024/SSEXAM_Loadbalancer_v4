@@ -17,6 +17,7 @@ import examAttemptroutes from "./routes/examattemptroutes.js";
 import qrScanRoutes from "./routes/qrScanRoutes.js";
 import registrationRoutes from "./routes/registrationRoutes.js";
 import departmentRoutes from "./routes/departmentRoutes.js";
+import questionLibraryRoutes from "./routes/questionLibraryRoutes.js";
 
 dotenv.config();
 
@@ -97,6 +98,7 @@ app.use(
   app.use("/api/student", studentExamRoutes);
   app.use("/api", examAttemptroutes);
   app.use("/api/admin/qr-scanner", qrScanRoutes);
+  app.use("/api/admin/question-library", questionLibraryRoutes);
   app.use("/api/departments", departmentRoutes);
   app.use("/api/student-registration", registrationRoutes);
 

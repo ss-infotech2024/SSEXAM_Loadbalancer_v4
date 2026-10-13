@@ -18,6 +18,7 @@ import {
 import {
   getExams,
   getExamById,
+  generateExamQuestions,
   createExam,
   updateExam,
   deleteExam,
@@ -95,6 +96,7 @@ router.post('/exams/questions/parse', handleUpload, parseQuestionsExcel);
 router.get   ('/exams',     getExams);
 router.post  ('/exams',     createExam);
 router.get   ('/exams/:id', getExamById);
+router.post  ('/exams/:id/ai-generate', generateExamQuestions);
 router.put   ('/exams/:id', updateExam);
 router.delete('/exams/:id', deleteExam);
 

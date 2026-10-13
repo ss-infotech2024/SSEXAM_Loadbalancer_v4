@@ -7,6 +7,7 @@ import {
   PageHeader, IconButton, StatCard, Card, Badge, PassFailBadge, EmptyState, ErrorState, Skeleton,
 } from "../../components/ui";
 import { formatIST } from "../../utils/time";
+import SectionBreakdown from "../../components/exam/SectionBreakdown";
 
 const GRADE_LABEL = {
   'A+': "Outstanding", 'A': "Excellent", 'B+': "Very good", 'B': "Good", 'C': "Average", 'D': "Pass", 'F': "Fail",
@@ -136,6 +137,7 @@ const StudentResults = () => {
                           <span className="flex items-center gap-1.5"><Star className="h-4 w-4 text-slate-400" aria-hidden="true" />{r.marksPerQuestion} marks / question</span>
                         )}
                       </div>
+                      <SectionBreakdown breakdown={r.sectionBreakdown} compact className="mt-2.5" />
                     </div>
                   </div>
                   <div className="flex items-center justify-between gap-4 border-t border-slate-100 pt-3 sm:block sm:border-0 sm:pt-0 sm:text-right">

@@ -6,16 +6,17 @@ import { AlertCircle, CheckCircle2, Trash2 } from "lucide-react";
 import { Badge, IconButton } from "../ui";
 import { cn } from "../../utils/cn";
 
-const QuestionEditorCard = ({ index, question: q, marks, errors, onChange, onRemove, inputRef }) => {
+const QuestionEditorCard = ({ index, question: q, sections = [], marks, errors, onChange, onRemove, inputRef }) => {
   const uid = useId();
   const textErr = errors[`q-${q.id}-text`];
   const correctErr = errors[`q-${q.id}-correct`];
   const answered = q.correctAnswer !== null && q.correctAnswer !== undefined;
+  const sectionErr = errors[`q-${q.id}-section`];
   const optErrors = q.options.map((_, i) => errors[`q-${q.id}-opt${i}`]).filter(Boolean);
 
   return (
     <article
-      className={cn("card p-4 sm:p-5", (textErr || correctErr || optErrors.length) && "border-rose-200")}
+      className={cn("card p-4 sm:p-5", (textErr || correctErr || sectionErr || optErrors.length) && "border-rose-200")}
       aria-labelledby={`${uid}-title`}
     >
       <header className="mb-3 flex items-center gap-2">
@@ -27,7 +28,18 @@ const QuestionEditorCard = ({ index, question: q, marks, errors, onChange, onRem
         {answered
           ? <Badge tone="success" icon={CheckCircle2} className="hidden sm:inline-flex">Answer set</Badge>
           : <Badge tone="warning" icon={AlertCircle} className="hidden sm:inline-flex">No answer</Badge>}
-        <IconButton icon={Trash2} label={`Remove question ${index + 1}`} size="sm" variant="danger-ghost" onClick={onRemove} className="ml-auto" />
+        {(sections.length > 0 || q.section) && <label htmlFor={`${uid}-section`} className="sr-only">Question {index + 1} section</label>}
+        {(sections.length > 0 || q.section) && <select
+          id={`${uid}-section`}
+          value={sections.includes(q.section) ? q.section : ""}
+          onChange={(e) => onChange("section", e.target.value)}
+          aria-invalid={sectionErr ? true : undefined}
+          className={cn("input ml-auto h-8 w-auto py-0 text-xs font-medium", sectionErr && "input-invalid")}
+        >
+          {(!q.section || !sections.includes(q.section)) && <option value="">{sectionErr ? "Choose a section" : "No section"}</option>}
+          {sections.map((sec) => <option key={sec} value={sec}>{sec}</option>)}
+        </select>}
+        <IconButton icon={Trash2} label={`Remove question ${index + 1}`} size="sm" variant="danger-ghost" className={!(sections.length > 0 || q.section) ? "ml-auto" : undefined} onClick={onRemove} />
       </header>
 
       <label htmlFor={`${uid}-text`} className="sr-only">Question {index + 1} text</label>

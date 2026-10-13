@@ -118,8 +118,10 @@ const ExamList = () => {
           cameraEnabled:    full.cameraEnabled !== false,
           shuffleQuestions: full.shuffleQuestions === true,
         },
+        sections: full.sections || [],
         questions: (full.questions || []).map((q) => ({
           id:            Date.now() + Math.random(),
+          section:       q.section || null,
           text:          q.text,
           options:       [...q.options],
           correctAnswer: q.correctAnswer ?? null,

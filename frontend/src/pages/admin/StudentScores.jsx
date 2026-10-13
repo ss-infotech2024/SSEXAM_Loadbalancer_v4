@@ -9,6 +9,7 @@ import {
 } from "../../components/ui";
 import { cn } from "../../utils/cn";
 import { formatDateTimeShortIST } from "../../utils/time";
+import SectionBreakdown from "../../components/exam/SectionBreakdown";
 
 // ─── CSV helper ───────────────────────────────────────────────────────────────
 const downloadCSV = (rows, filename) => {
@@ -16,6 +17,12 @@ const downloadCSV = (rows, filename) => {
     alert("No data to download");
     return;
   }
+
+  // Section names are admin-defined per exam: one score column per distinct name in these results
+  const sectionNames = [];
+  rows.forEach((r) => (r.sectionBreakdown || []).forEach((sb) => {
+    if (!sectionNames.includes(sb.section)) sectionNames.push(sb.section);
+  }));
 
   const headers = [
     "Student Name",
@@ -31,6 +38,7 @@ const downloadCSV = (rows, filename) => {
     "Correct",
     "Wrong",
     "Skipped",
+    ...sectionNames.map((n) => `${n} Score`),
     "Status",
     "Submitted At",
   ];
@@ -44,7 +52,7 @@ const downloadCSV = (rows, filename) => {
   };
 
   const csvContent = [
-    headers.join(","),
+    headers.map(escape).join(","),
     ...rows.map((r) =>
       [
         r.student?.name || r.student?.fullName || "",
@@ -60,6 +68,10 @@ const downloadCSV = (rows, filename) => {
         r.correctCount ?? "",
         r.wrongCount ?? "",
         r.skippedCount ?? r.unansweredCount ?? "",
+        ...sectionNames.map((n) => {
+          const sb = r.sectionBreakdown?.find((x) => x.section === n);
+          return sb ? `${sb.score}/${sb.totalMarks}` : "";
+        }),
         (r.percentage ?? 0) >= 40 ? "Pass" : "Fail",
         r.submittedAt
           ? new Date(r.submittedAt).toLocaleString("en-IN")
@@ -572,6 +584,7 @@ const StudentScores = () => {
                         <span className="font-semibold text-emerald-700" title="Correct">{result.correctCount || 0} ✓</span>{" "}
                         <span className="font-semibold text-rose-700" title="Wrong">{result.wrongCount || 0} ✗</span>{" "}
                         <span className="text-slate-500" title="Skipped">{result.skippedCount ?? result.unansweredCount ?? 0} skipped</span>
+                        <SectionBreakdown breakdown={result.sectionBreakdown} compact className="mt-1.5" />
                       </td>
                       <td className="whitespace-nowrap text-xs text-slate-500">{result.submittedAt ? formatDateTimeShortIST(result.submittedAt) : "N/A"}</td>
                     </tr>
@@ -602,6 +615,7 @@ const StudentScores = () => {
                       {result.correctCount || 0} correct · {result.wrongCount || 0} wrong · {submitted(result)}
                     </span>
                   </div>
+                  <SectionBreakdown breakdown={result.sectionBreakdown} compact className="mt-2" />
                 </li>
               ))}
             </ul>

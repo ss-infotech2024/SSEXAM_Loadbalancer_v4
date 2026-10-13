@@ -4,10 +4,11 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import xlsx from 'xlsx';
 import { body, validationResult } from 'express-validator';
-import Exam from '../models/exam.model.js';
+import Exam, { MAX_SECTIONS, MAX_SECTION_NAME_LEN } from '../models/exam.model.js';
 import User from '../models/user.models.js';
 import ExamAttempt from '../models/examattempt.model.js';
 import ExamSession from '../models/examSession.model.js';
+import { generateQuestions, isAiConfigured, AiError, AI_MAX_QUESTIONS } from '../services/aiQuestionService.js';
 
 // A live session that hasn't sent a heartbeat for this long is treated as gone
 const LIVE_TIMEOUT_MS = 90 * 1000;
@@ -60,6 +61,11 @@ const computeStatus = (exam) => {
   return 'completed';
 };
 
+// An AI exam that hasn't generated yet still advertises how many questions it will have.
+const aiPartsTotal = (exam) => (exam.aiConfig?.parts || []).reduce((n, p) => n + (p.count || 0), 0);
+const questionTotal = (exam) =>
+  exam.questions?.length ? exam.questions.length : (exam.aiConfig?.enabled ? aiPartsTotal(exam) : 0);
+
 const shapeExam = (exam) => ({
   _id:              exam._id,
   subject:          exam.subject,
@@ -68,9 +74,15 @@ const shapeExam = (exam) => ({
   endTime:          exam.endTime,
   department:       exam.department,
   status:           computeStatus(exam),
-  questionCount:    exam.questions?.length ?? 0,
+  questionCount:    questionTotal(exam),
   marksPerQuestion: exam.marksPerQuestion ?? 1,
-  totalMarks:       (exam.questions?.length ?? 0) * (exam.marksPerQuestion ?? 1),
+  totalMarks:       questionTotal(exam) * (exam.marksPerQuestion ?? 1),
+  aiConfig:         exam.aiConfig?.enabled ? {
+    enabled: true,
+    parts: (exam.aiConfig.parts || []).map((p) => ({ topic: p.topic, count: p.count, difficulty: p.difficulty })),
+    language: exam.aiConfig.language,
+    status: exam.aiConfig.status, error: exam.aiConfig.error || null,
+  } : { enabled: false },
   cameraEnabled:    exam.cameraEnabled ?? true,
   shuffleQuestions: exam.shuffleQuestions ?? false,
   createdAt:        exam.createdAt,
@@ -79,13 +91,105 @@ const shapeExam = (exam) => ({
 
 const shapeExamFull = (exam) => ({
   ...shapeExam(exam),
+  sections: examSections(exam),
   questions: exam.questions.map((q) => ({
     _id:           q._id,
     text:          q.text,
     options:       q.options,
     correctAnswer: q.correctAnswer,
+    section:       q.section || null,
   })),
 });
+
+// ── Sections ────────────────────────────────────────────────────────────────
+// Sections are defined by the admin per exam (exam.sections, in display order).
+// A question's `section` must be one of them; a question with none is "unsectioned".
+
+const sectionKey = (v) => String(v ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+const tidyName   = (v) => String(v ?? '').trim().replace(/\s+/g, ' ');
+
+// Validate/normalise an admin-supplied list: trims, collapses spaces, drops blanks,
+// removes case-insensitive duplicates. Returns { sections } or { error }.
+const parseSectionList = (raw) => {
+  if (!Array.isArray(raw)) return { error: 'sections must be an array of names' };
+  const seen = new Set();
+  const sections = [];
+  for (const item of raw) {
+    if (typeof item !== 'string') return { error: 'Each section name must be text' };
+    const name = tidyName(item);
+    if (!name) continue;
+    if (name.length > MAX_SECTION_NAME_LEN)
+      return { error: `Section name "${name.slice(0, 20)}…" is too long (max ${MAX_SECTION_NAME_LEN} characters)` };
+    const key = sectionKey(name);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    sections.push(name);
+  }
+  if (sections.length > MAX_SECTIONS) return { error: `An exam can have at most ${MAX_SECTIONS} sections` };
+  return { sections };
+};
+
+// Distinct section names used by questions, in order of first appearance.
+const sectionsFromQuestions = (qs = []) => {
+  const seen = new Set();
+  const out  = [];
+  qs.forEach((q) => {
+    const name = tidyName(q.section);
+    if (name && !seen.has(sectionKey(name))) { seen.add(sectionKey(name)); out.push(name); }
+  });
+  return out;
+};
+
+// The exam's configured sections; exams saved before this field existed fall back to
+// whatever their questions already use.
+const examSections = (exam) => (exam.sections?.length ? [...exam.sections] : sectionsFromQuestions(exam.questions));
+
+// Sections actually containing questions (what students and exports show), in exam order.
+const usedSections = (exam) => {
+  const used = new Set((exam.questions || []).map((q) => sectionKey(q.section)));
+  return examSections(exam).filter((n) => used.has(sectionKey(n)));
+};
+
+// Canonical spelling of a question's section within `sections`, or undefined.
+const resolveSection = (v, sections) => {
+  const key = sectionKey(v);
+  return key ? sections.find((n) => sectionKey(n) === key) : undefined;
+};
+
+// Returns an error message when a question's section isn't one of the exam's, otherwise null.
+// A missing section is allowed (unsectioned paper); an unknown one is not.
+const sectionError = (q, i, sections) =>
+  sectionKey(q.section) && !resolveSection(q.section, sections)
+    ? `Question ${i + 1}: section "${tidyName(q.section)}" is not one of this exam's sections${sections.length ? ` (${sections.join(', ')})` : ''}`
+    : null;
+
+// Keep questions grouped by section (stable; unsectioned last) so students see each section together.
+const sortBySection = (qs, sections) => {
+  const rank = (q) => { const i = sections.findIndex((n) => sectionKey(n) === sectionKey(q.section)); return i === -1 ? sections.length : i; };
+  return qs.map((q, i) => [q, i]).sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]).map(([q]) => q);
+};
+
+// Per-section summary of an attempt, in the exam's section order (sections not in the
+// list — e.g. renamed since the attempt — follow in first-seen order). Empty for old
+// attempts / unsectioned exams so callers can simply hide the breakdown.
+const buildSectionBreakdown = (answers = [], marksPerQuestion = 1, order = []) => {
+  const map = new Map();
+  answers.forEach((a) => {
+    if (!a.section) return;
+    const row = map.get(a.section) || { section: a.section, totalQuestions: 0, correctCount: 0, wrongCount: 0, skippedCount: 0, score: 0, totalMarks: 0 };
+    row.totalQuestions++;
+    row.totalMarks += marksPerQuestion;
+    if (a.isCorrect) { row.correctCount++; row.score += a.marksObtained ?? marksPerQuestion; }
+    else if (a.userAnswer === -1) row.skippedCount++;
+    else row.wrongCount++;
+    map.set(a.section, row);
+  });
+  const names = [...order.filter((n) => map.has(n)), ...[...map.keys()].filter((n) => !order.includes(n))];
+  return names.map((n) => {
+    const r = map.get(n);
+    return { ...r, percentage: r.totalMarks ? parseFloat(((r.score / r.totalMarks) * 100).toFixed(2)) : 0 };
+  });
+};
 
 // =============================================================================
 // GET /api/admin/exams
@@ -121,6 +225,116 @@ export const getExamById = async (req, res) => {
 // =============================================================================
 // POST /api/admin/exams
 // =============================================================================
+// ── AI paper generation ───────────────────────────────────────────────────────
+const GENERATING_STALE_MS = 3 * 60 * 1000;   // a crashed worker must not block the exam forever
+const AI_DIFFICULTIES = ['easy', 'medium', 'hard'];
+
+const AI_MAX_PARTS = 8;
+const AI_MAX_TOTAL = 60;
+
+// Validates the admin-supplied aiConfig: { enabled, language, parts: [{ topic, count, difficulty }] }.
+// Each part (topic) becomes its own section. Returns { value } or { error }.
+const parseAiConfig = (raw) => {
+  if (!raw || raw.enabled !== true) return { value: { enabled: false } };
+  const language = String(raw.language ?? 'English').trim() || 'English';
+  if (language.length > 30) return { error: 'Invalid language' };
+  if (!Array.isArray(raw.parts) || raw.parts.length === 0) return { error: 'Add at least one topic' };
+  if (raw.parts.length > AI_MAX_PARTS) return { error: `At most ${AI_MAX_PARTS} topics are allowed` };
+
+  const seen = new Set(), parts = [];
+  let total = 0;
+  for (const [i, p] of raw.parts.entries()) {
+    const topic = tidyName(p?.topic);
+    const count = parseInt(p?.count, 10);
+    const difficulty = p?.difficulty ?? 'medium';
+    if (!topic)                                  return { error: `Topic ${i + 1}: enter a topic` };
+    if (topic.length > MAX_SECTION_NAME_LEN)     return { error: `Topic ${i + 1}: too long (max ${MAX_SECTION_NAME_LEN} characters)` };
+    if (!AI_DIFFICULTIES.includes(difficulty))   return { error: `Topic ${i + 1}: invalid difficulty` };
+    if (!(count >= 1 && count <= AI_MAX_QUESTIONS)) return { error: `Topic ${i + 1}: choose 1–${AI_MAX_QUESTIONS} questions` };
+    const key = sectionKey(topic);
+    if (seen.has(key))                           return { error: `Topic "${topic}" is listed twice` };
+    seen.add(key);
+    total += count;
+    parts.push({ topic, count, difficulty });
+  }
+  if (total > AI_MAX_TOTAL) return { error: `At most ${AI_MAX_TOTAL} AI questions per exam (you asked for ${total})` };
+  return { value: { enabled: true, parts, language, status: 'idle' } };
+};
+
+/**
+ * Generate the paper for an AI exam exactly once, even if many students open it at the same moment.
+ * Resolves to 'ready' | 'generating' | 'failed'.
+ */
+const ensureAiQuestions = async (examId, { force = false } = {}) => {
+  const stale = new Date(Date.now() - GENERATING_STALE_MS);
+  const claim = await Exam.findOneAndUpdate(
+    {
+      _id: examId, 'aiConfig.enabled': true,
+      $or: [
+        { 'aiConfig.status': { $in: ['idle', 'failed'] } },
+        { 'aiConfig.status': 'generating', 'aiConfig.startedAt': { $lt: stale } },
+        ...(force ? [{ 'aiConfig.status': 'ready' }] : []),
+      ],
+    },
+    { $set: { 'aiConfig.status': 'generating', 'aiConfig.startedAt': new Date(), 'aiConfig.error': '' } },
+    { new: true }
+  );
+  if (!claim) {
+    const cur = await Exam.findById(examId).select('aiConfig questions').lean();
+    if (cur?.aiConfig?.status === 'ready' && cur.questions?.length) return 'ready';
+    return cur?.aiConfig?.status === 'failed' ? 'failed' : 'generating';
+  }
+
+  try {
+    const { parts, language } = claim.aiConfig;
+    // One AI call per topic, one after another (gentle on free-tier rate limits). All-or-nothing:
+    // if any topic fails nothing is saved and the next request tries again.
+    const questions = [];
+    for (const part of parts) {
+      const drafts = await generateQuestions({ topic: part.topic, difficulty: part.difficulty, count: part.count, language });
+      if (drafts.length < part.count)
+        throw new AiError(`The AI returned only ${drafts.length} of ${part.count} usable questions for "${part.topic}". Please try again.`, 503);
+      drafts.forEach(d => questions.push({ section: part.topic, text: d.text, options: d.options, correctAnswer: d.correctAnswer }));
+    }
+    await Exam.updateOne({ _id: examId }, {
+      $set: {
+        questions,
+        sections: parts.map(p => p.topic),
+        'aiConfig.status': 'ready', 'aiConfig.error': '',
+      },
+    });
+    return 'ready';
+  } catch (err) {
+    console.error('ensureAiQuestions:', err.message);
+    await Exam.updateOne({ _id: examId }, {
+      $set: { 'aiConfig.status': 'failed', 'aiConfig.error': (err instanceof AiError ? err.message : 'AI generation failed').slice(0, 300) },
+    });
+    return 'failed';
+  }
+};
+
+// POST /api/admin/exams/:id/ai-generate  — admin generates (or regenerates) the paper early, to review it
+export const generateExamQuestions = async (req, res) => {
+  try {
+    const adminDept = await getAdminDept(req, res);
+    if (!adminDept) return;
+    const exam = await Exam.findOne({ _id: req.params.id, department: adminDept });
+    if (!exam) return res.status(404).json({ message: 'Exam not found' });
+    if (!exam.aiConfig?.enabled) return res.status(400).json({ message: 'This exam is not set up for AI questions' });
+    if (!isAiConfigured()) return res.status(503).json({ message: 'AI generation is not enabled on this server.' });
+    if (new Date() >= exam.startTime) return res.status(400).json({ message: 'The exam has started; its questions can no longer be regenerated' });
+
+    const status = await ensureAiQuestions(exam._id, { force: true });
+    const fresh  = await Exam.findById(exam._id);
+    if (status === 'failed') return res.status(503).json({ message: fresh.aiConfig.error || 'AI generation failed. Try again.' });
+    if (status === 'generating') return res.status(409).json({ message: 'Questions are already being generated. Try again in a moment.' });
+    res.status(200).json({ message: `Generated ${fresh.questions.length} questions`, exam: shapeExamFull(fresh) });
+  } catch (err) {
+    console.error('generateExamQuestions:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
 export const createExam = [
   body('subject').trim().notEmpty().withMessage('Subject name is required'),
   body('duration').isInt({ min: 1 }).withMessage('Duration must be a positive number of minutes'),
@@ -130,6 +344,7 @@ export const createExam = [
   body('cameraEnabled').optional().isBoolean().withMessage('cameraEnabled must be true or false').toBoolean(true),
   body('shuffleQuestions').optional().isBoolean().withMessage('shuffleQuestions must be true or false').toBoolean(true),
   body('questions').optional().isArray().withMessage('Questions must be an array'),
+  body('sections').optional().isArray().withMessage('Sections must be an array'),
   body('questions.*.text').if(body('questions').exists()).trim().notEmpty().withMessage('Each question must have text'),
   body('questions.*.options').if(body('questions').exists()).isArray({ min: 4, max: 4 }).withMessage('Each question must have exactly 4 options'),
   body('questions.*.correctAnswer').if(body('questions').exists()).isInt({ min: 0, max: 3 }).withMessage('Correct answer must be 0–3'),
@@ -145,6 +360,20 @@ export const createExam = [
       if (new Date(endTime) <= new Date(startTime))
         return res.status(400).json({ message: 'End time must be after start time' });
 
+      const ai = parseAiConfig(req.body.aiConfig);
+      if (ai.error) return res.status(400).json({ message: ai.error });
+      if (ai.value.enabled) {
+        if (!isAiConfigured()) return res.status(503).json({ message: 'AI generation is not enabled on this server.' });
+        if (questions.length) return res.status(400).json({ message: 'An AI exam creates its own questions; do not send any' });
+      }
+
+      // Admin-defined sections. If the client sent none, use whatever the questions name.
+      const parsedSections = req.body.sections === undefined
+        ? { sections: sectionsFromQuestions(questions) }
+        : parseSectionList(req.body.sections);
+      if (parsedSections.error) return res.status(400).json({ message: parsedSections.error });
+      const sections = ai.value.enabled ? ai.value.parts.map(p => p.topic) : parsedSections.sections;
+
       for (let i = 0; i < questions.length; i++) {
         const q = questions[i];
         if (!q.text?.trim())
@@ -155,6 +384,8 @@ export const createExam = [
           return res.status(400).json({ message: `Question ${i + 1}: all options must be non-empty` });
         if (q.correctAnswer == null || q.correctAnswer < 0 || q.correctAnswer > 3)
           return res.status(400).json({ message: `Question ${i + 1}: correctAnswer must be 0–3` });
+        const secErr = sectionError(q, i, sections);
+        if (secErr) return res.status(400).json({ message: secErr });
       }
 
       const exam = await Exam.create({
@@ -167,7 +398,10 @@ export const createExam = [
         marksPerQuestion: Number(marksPerQuestion),
         cameraEnabled:    typeof cameraEnabled === 'boolean' ? cameraEnabled : true,
         shuffleQuestions: shuffleQuestions === true,
-        questions:        questions.map(q => ({
+        sections,
+        ...(ai.value.enabled ? { aiConfig: ai.value } : {}),
+        questions:        sortBySection(questions, sections).map(q => ({
+          section:       resolveSection(q.section, sections),
           text:          q.text.trim(),
           options:       q.options.map(o => String(o).trim()),
           correctAnswer: Number(q.correctAnswer),
@@ -200,6 +434,7 @@ export const updateExam = [
   body('cameraEnabled').optional().isBoolean().withMessage('cameraEnabled must be true or false').toBoolean(true),
   body('shuffleQuestions').optional().isBoolean().withMessage('shuffleQuestions must be true or false').toBoolean(true),
   body('questions').optional().isArray().withMessage('Questions must be an array'),
+  body('sections').optional().isArray().withMessage('Sections must be an array'),
 
   async (req, res) => {
     if (!firstError(req, res)) return;
@@ -223,6 +458,21 @@ export const updateExam = [
       if (exam.endTime <= exam.startTime)
         return res.status(400).json({ message: 'End time must be after start time' });
 
+      // Section list the questions are validated against: the one sent, else the exam's current one.
+      let sections = examSections(exam);
+      if (req.body.sections !== undefined) {
+        const parsedSections = parseSectionList(req.body.sections);
+        if (parsedSections.error) return res.status(400).json({ message: parsedSections.error });
+        sections = parsedSections.sections;
+      }
+
+      // Sections changed but questions weren't resent: the saved questions must still fit.
+      if (req.body.sections !== undefined && !Array.isArray(questions)) {
+        const orphan = exam.questions.find((q) => sectionKey(q.section) && !resolveSection(q.section, sections));
+        if (orphan) return res.status(400).json({ message: `Section "${orphan.section}" still has questions — move them before removing it` });
+        exam.questions.forEach((q) => { q.section = resolveSection(q.section, sections); });
+      }
+
       if (Array.isArray(questions)) {
         for (let i = 0; i < questions.length; i++) {
           const q = questions[i];
@@ -234,14 +484,18 @@ export const updateExam = [
             return res.status(400).json({ message: `Question ${i + 1}: all options must be non-empty` });
           if (q.correctAnswer == null || q.correctAnswer < 0 || q.correctAnswer > 3)
             return res.status(400).json({ message: `Question ${i + 1}: correctAnswer must be 0–3` });
+          const secErr = sectionError(q, i, sections);
+          if (secErr) return res.status(400).json({ message: secErr });
         }
-        exam.questions = questions.map(q => ({
+        exam.questions = sortBySection(questions, sections).map(q => ({
+          section:       resolveSection(q.section, sections),
           text:          q.text.trim(),
           options:       q.options.map(o => String(o).trim()),
           correctAnswer: Number(q.correctAnswer),
         }));
       }
 
+      exam.sections = sections;
       await exam.save();
       res.status(200).json({ message: 'Exam updated successfully', exam: shapeExamFull(exam) });
     } catch (err) {
@@ -291,8 +545,9 @@ export const downloadExamTemplate = (req, res) => {
   res.sendFile(templatePath);
 };
 
-// ── Excel "Questions" sheet → [{ text, options, correctAnswer }] ──────────────
-// Returns { questions } or { error: { message, errors? } } (send as a 400 body)
+// ── Excel "Questions" sheet → { questions, sections } ─────────────────────────
+// Section names are whatever the admin types in the Section column (first-seen order).
+// Returns { questions, sections } or { error: { message, errors? } } (send as a 400 body)
 const parseQuestionsSheet = (workbook) => {
   if (!workbook.SheetNames.includes('Questions')) {
     return { error: { message: 'Sheet "Questions" not found. Please use the provided template without renaming sheets.' } };
@@ -300,7 +555,7 @@ const parseQuestionsSheet = (workbook) => {
 
   const qSheet  = workbook.Sheets['Questions'];
   const rawRows = xlsx.utils.sheet_to_json(qSheet, {
-    header: ['num', 'text', 'optA', 'optB', 'optC', 'optD', 'correct'],
+    header: ['num', 'text', 'optA', 'optB', 'optC', 'optD', 'correct', 'section'],
     range:  1,
     defval: '',
   });
@@ -316,6 +571,11 @@ const parseQuestionsSheet = (workbook) => {
   const answerMap      = { A: 0, B: 1, C: 2, D: 3 };
   const questions      = [];
   const questionErrors = [];
+  // Old templates have no Section column: if every row leaves it blank the paper is unsectioned.
+  // Once any row has a section, every row must have one.
+  const usesSections   = filledRows.some((r) => String(r.section || '').trim());
+  const sections       = [];                 // canonical names, first-seen spelling wins
+  const sectionByKey   = new Map();
 
   filledRows.forEach((row, i) => {
     const rowNum  = i + 2;
@@ -334,8 +594,24 @@ const parseQuestionsSheet = (workbook) => {
     if (!['A', 'B', 'C', 'D'].includes(correct))
       questionErrors.push(`Row ${rowNum}: Correct Answer must be A, B, C, or D (got "${row.correct}").`);
 
-    if (qText && optA && optB && optC && optD && ['A', 'B', 'C', 'D'].includes(correct)) {
+    const sectionRaw = tidyName(row.section);
+    let section      = sectionByKey.get(sectionKey(sectionRaw));
+    let sectionOk    = true;
+    if (usesSections && !sectionRaw) {
+      sectionOk = false;
+      questionErrors.push(`Row ${rowNum}: Section is blank — fill it in for every row (or leave the whole column empty for no sections).`);
+    } else if (sectionRaw.length > MAX_SECTION_NAME_LEN) {
+      sectionOk = false;
+      questionErrors.push(`Row ${rowNum}: Section name is too long (max ${MAX_SECTION_NAME_LEN} characters).`);
+    } else if (sectionRaw && !section) {
+      section = sectionRaw;
+      sectionByKey.set(sectionKey(sectionRaw), sectionRaw);
+      sections.push(sectionRaw);
+    }
+
+    if (qText && optA && optB && optC && optD && ['A', 'B', 'C', 'D'].includes(correct) && sectionOk) {
       questions.push({
+        section:       usesSections ? section : undefined,
         text:          qText,
         options:       [optA, optB, optC, optD],
         correctAnswer: answerMap[correct],
@@ -343,10 +619,13 @@ const parseQuestionsSheet = (workbook) => {
     }
   });
 
+  if (sections.length > MAX_SECTIONS)
+    questionErrors.push(`The sheet uses ${sections.length} different sections; an exam can have at most ${MAX_SECTIONS}.`);
+
   if (questionErrors.length)
     return { error: { message: 'Validation errors in the Questions sheet:', errors: questionErrors } };
 
-  return { questions };
+  return { questions: sortBySection(questions, sections), sections };
 };
 
 // =============================================================================
@@ -369,7 +648,7 @@ export const parseQuestionsExcel = (req, res) => {
   const parsed = parseQuestionsSheet(workbook);
   if (parsed.error) return res.status(400).json(parsed.error);
 
-  res.status(200).json({ questions: parsed.questions, count: parsed.questions.length });
+  res.status(200).json({ questions: parsed.questions, sections: parsed.sections, count: parsed.questions.length });
 };
 
 // =============================================================================
@@ -440,7 +719,7 @@ export const uploadAndCreateExam = async (req, res) => {
     // 3. Read "Questions" sheet
     const parsed = parseQuestionsSheet(workbook);
     if (parsed.error) return res.status(400).json(parsed.error);
-    const { questions } = parsed;
+    const { questions, sections } = parsed;
 
     // 4. Admin department
     const adminDept = await getAdminDept(req, res);
@@ -455,7 +734,8 @@ export const uploadAndCreateExam = async (req, res) => {
       department:       adminDept,
       createdBy:        req.user._id || req.user.id,
       marksPerQuestion,
-      questions,
+      sections,
+      questions,   // already grouped by section by parseQuestionsSheet
     });
 
     if (req.file.path) fs.unlink(req.file.path, () => {});
@@ -510,16 +790,34 @@ export const getStudentExamById = async (req, res) => {
     if (!student || student.role !== 'student')
       return res.status(403).json({ message: 'Access denied' });
 
-    const exam = await Exam.findOne({ _id: req.params.id, department: student.department });
+    let exam = await Exam.findOne({ _id: req.params.id, department: student.department });
     if (!exam) return res.status(404).json({ message: 'Exam not found' });
 
     const now = new Date();
     if (now < exam.startTime) return res.status(403).json({ message: 'This exam has not started yet' });
     if (now > exam.endTime)   return res.status(403).json({ message: 'This exam has already ended' });
 
-    const questions = exam.shuffleQuestions
-      ? seededShuffle(exam.questions, `${exam._id}:${student._id}`)
-      : exam.questions;
+    // AI exam whose paper hasn't been generated yet: build it now (once, for everyone).
+    if (exam.aiConfig?.enabled && exam.questions.length === 0) {
+      const status = await ensureAiQuestions(exam._id);
+      if (status !== 'ready')
+        return res.status(503).json({ message: status === 'failed'
+          ? 'The questions could not be prepared. Please tell your admin.'
+          : 'Your questions are being prepared. Please try again in a few seconds.', retry: status === 'generating' });
+      exam = await Exam.findById(exam._id);
+    }
+
+    // Shuffle per student, but keep sections together: questions are shuffled
+    // inside each section, and sections stay in the admin's order.
+    const sectionOrder = usedSections(exam);
+    let questions = exam.questions;
+    if (exam.shuffleQuestions) {
+      const seed = `${exam._id}:${student._id}`;
+      questions = sectionOrder.length
+        ? [...sectionOrder, undefined].flatMap(n =>
+            seededShuffle(exam.questions.filter(q => (resolveSection(q.section, sectionOrder) || undefined) === n), `${seed}:${n}`))
+        : seededShuffle(exam.questions, seed);
+    }
 
     res.status(200).json({
       exam: {
@@ -531,8 +829,10 @@ export const getStudentExamById = async (req, res) => {
         marksPerQuestion: exam.marksPerQuestion,
         totalMarks:       exam.questions.length * exam.marksPerQuestion,
         cameraEnabled:    exam.cameraEnabled ?? true,
+        sections:         sectionOrder,
         questions:        questions.map(q => ({
           _id:     q._id,
+          section: q.section || null,
           text:    q.text,
           options: q.options,
         })),
@@ -676,6 +976,7 @@ export const submitExam = async (req, res) => {
         percentage: existingAttempt.percentage,
         grade: existingAttempt.grade,
         correctCount, wrongCount, unansweredCount,
+        sectionBreakdown: buildSectionBreakdown(existingAttempt.answers, exam.marksPerQuestion, examSections(exam)),
         submittedAt: existingAttempt.submittedAt,
       });
     }
@@ -702,7 +1003,7 @@ export const submitExam = async (req, res) => {
 
       const isCorrect    = userAnswer === question.correctAnswer;
       const marksObtained = isCorrect ? exam.marksPerQuestion : 0;
-      return { questionId: question._id, userAnswer, isCorrect, marksObtained };
+      return { questionId: question._id, section: question.section, userAnswer, isCorrect, marksObtained };
     });
 
     const score      = formattedAnswers.reduce((s, a) => s + a.marksObtained, 0);
@@ -738,7 +1039,7 @@ export const submitExam = async (req, res) => {
     res.status(200).json({
       success: true,
       message: 'Exam submitted successfully',
-      result:  { score, totalMarks, percentage, grade, correctCount, wrongCount, unansweredCount, submittedAt: attempt.submittedAt },
+      result:  { score, totalMarks, percentage, grade, correctCount, wrongCount, unansweredCount, submittedAt: attempt.submittedAt, sectionBreakdown: buildSectionBreakdown(formattedAnswers, exam.marksPerQuestion, examSections(exam)) },
     });
   } catch (err) {
     console.error('submitExam error:', err);
@@ -797,7 +1098,7 @@ export const getStudentResults = async (req, res) => {
       return res.status(403).json({ message: 'Access denied. Student only.' });
 
     const results = await ExamAttempt.find({ studentId: student._id, status: 'completed' })
-      .populate('examId', 'subject department startTime endTime duration marksPerQuestion')
+      .populate('examId', 'subject department startTime endTime duration marksPerQuestion sections')
       .sort({ submittedAt: -1 }).lean();
 
     const formattedResults = results.map(result => {
@@ -821,6 +1122,7 @@ export const getStudentResults = async (req, res) => {
         percentage:       result.percentage,
         grade:            result.grade,
         correctCount, wrongCount, skippedCount,
+        sectionBreakdown: buildSectionBreakdown(result.answers, result.examId?.marksPerQuestion || 1, examSections(result.examId || {})),
         submittedAt:      result.submittedAt,
       };
     });
@@ -844,7 +1146,7 @@ export const getAdminResults = async (req, res) => {
     const examIds = exams.map(e => e._id);
 
     const attempts = await ExamAttempt.find({ examId: { $in: examIds }, status: 'completed' })
-      .populate({ path: 'examId',    select: 'subject department duration marksPerQuestion startTime endTime' })
+      .populate({ path: 'examId',    select: 'subject department duration marksPerQuestion startTime endTime sections' })
       .populate({ path: 'studentId', select: 'fullName email rollNumber studentId department' })
       .sort({ submittedAt: -1 }).lean();
 
@@ -874,6 +1176,7 @@ export const getAdminResults = async (req, res) => {
         score: attempt.score || 0, totalMarks: attempt.totalMarks || 0,
         percentage: attempt.percentage || 0, grade: attempt.grade || 'F',
         correctCount, wrongCount, skippedCount,
+        sectionBreakdown: buildSectionBreakdown(attempt.answers, attempt.examId?.marksPerQuestion || 1, examSections(attempt.examId || {})),
         submittedAt: attempt.submittedAt, startedAt: attempt.startedAt,
       };
     });
@@ -932,6 +1235,7 @@ export const getExamResults = async (req, res) => {
         score: attempt.score || 0, totalMarks: attempt.totalMarks || 0,
         percentage: attempt.percentage || 0, grade: attempt.grade || 'F',
         correctCount, wrongCount, skippedCount, submittedAt: attempt.submittedAt,
+        sectionBreakdown: buildSectionBreakdown(attempt.answers, exam.marksPerQuestion, examSections(exam)),
       };
     });
 
@@ -941,7 +1245,7 @@ export const getExamResults = async (req, res) => {
 
     res.status(200).json({
       success: true,
-      exam: { _id: exam._id, subject: exam.subject, department: exam.department, duration: exam.duration, marksPerQuestion: exam.marksPerQuestion, totalQuestions: exam.questions.length, totalMarks: exam.questions.length * exam.marksPerQuestion, startTime: exam.startTime, endTime: exam.endTime },
+      exam: { _id: exam._id, subject: exam.subject, department: exam.department, duration: exam.duration, marksPerQuestion: exam.marksPerQuestion, sections: usedSections(exam), totalQuestions: exam.questions.length, totalMarks: exam.questions.length * exam.marksPerQuestion, startTime: exam.startTime, endTime: exam.endTime },
       summary: { totalStudents, averageScore, passCount, failCount: totalStudents - passCount, passRate: totalStudents > 0 ? Math.round((passCount / totalStudents) * 100) : 0, highestScore: totalStudents > 0 ? Math.max(...formattedResults.map(r => r.percentage)) : 0, lowestScore: totalStudents > 0 ? Math.min(...formattedResults.map(r => r.percentage)) : 0 },
       results: formattedResults,
     });
@@ -964,7 +1268,7 @@ export const getStudentResultsByAdmin = async (req, res) => {
     if (!student) return res.status(404).json({ message: 'Student not found or not in your department' });
 
     const attempts = await ExamAttempt.find({ studentId: req.params.studentId, status: 'completed' })
-      .populate('examId', 'subject department duration marksPerQuestion startTime endTime')
+      .populate('examId', 'subject department duration marksPerQuestion startTime endTime sections')
       .sort({ submittedAt: -1 }).lean();
 
     const formattedResults = attempts.map(attempt => {
@@ -979,6 +1283,7 @@ export const getStudentResultsByAdmin = async (req, res) => {
         exam: { _id: attempt.examId._id, subject: attempt.examId.subject, department: attempt.examId.department, duration: attempt.examId.duration, marksPerQuestion: attempt.examId.marksPerQuestion, startTime: attempt.examId.startTime, endTime: attempt.examId.endTime },
         score: attempt.score, totalMarks: attempt.totalMarks, percentage: attempt.percentage, grade: attempt.grade,
         correctCount, wrongCount, skippedCount, submittedAt: attempt.submittedAt,
+        sectionBreakdown: buildSectionBreakdown(attempt.answers, attempt.examId.marksPerQuestion || 1, examSections(attempt.examId)),
       };
     });
 
@@ -1013,7 +1318,13 @@ export const exportExamResults = async (req, res) => {
     const attempts = await ExamAttempt.find({ examId: req.params.examId, status: 'completed' })
       .populate('studentId', 'fullName email rollNumber').sort({ percentage: -1 }).lean();
 
-    const csvRows = [['Roll Number','Student Name','Email','Score','Total Marks','Percentage','Grade','Correct Answers','Wrong Answers','Skipped Questions','Submitted At'].join(',')];
+    // Current sections, plus any names older attempts were scored under (e.g. before a rename)
+    const csvSections = [...usedSections(exam)];
+    attempts.forEach((a) => (a.answers || []).forEach((ans) => {
+      if (ans.section && !csvSections.includes(ans.section)) csvSections.push(ans.section);
+    }));
+    const csvRows = [['Roll Number','Student Name','Email','Score','Total Marks','Percentage','Grade','Correct Answers','Wrong Answers','Skipped Questions',
+      ...csvSections.map(n => `"${n.replace(/"/g, '""')} Score"`), 'Submitted At'].join(',')];
 
     for (const attempt of attempts) {
       let correctCount = 0, wrongCount = 0, skippedCount = 0;
@@ -1021,7 +1332,12 @@ export const exportExamResults = async (req, res) => {
       csvRows.push([
         `"${attempt.studentId?.rollNumber || 'N/A'}"`, `"${attempt.studentId?.fullName || 'N/A'}"`, `"${attempt.studentId?.email || 'N/A'}"`,
         attempt.score, attempt.totalMarks, attempt.percentage, attempt.grade,
-        correctCount, wrongCount, skippedCount, new Date(attempt.submittedAt).toLocaleString(),
+        correctCount, wrongCount, skippedCount,
+        ...csvSections.map(n => {
+          const sb = buildSectionBreakdown(attempt.answers, exam.marksPerQuestion, examSections(exam)).find(r => r.section === n);
+          return sb ? `"${sb.score}/${sb.totalMarks}"` : '"-"';
+        }),
+        new Date(attempt.submittedAt).toLocaleString(),
       ].join(','));
     }
 

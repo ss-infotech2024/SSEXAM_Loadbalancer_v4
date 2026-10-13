@@ -10,6 +10,7 @@ import StudentScores from "../pages/admin/StudentScores";
 import CreateExam from "../pages/admin/CreateExam";
 import ExamList from "../pages/admin/Examlist";
 import EditExam from "../pages/admin/Editexam";
+import QuestionLibrary from "../pages/admin/QuestionLibrary";
 
 // ── Student pages (each has its own layout/sidebar built-in) ──────────────────
 import StudentDashboard from "../pages/student/StudentDashboard";
@@ -112,6 +113,12 @@ const AppRouter = () => {
       <Route path="/admin/create-exam" element={
         <ProtectedRoute allowedRoles={["admin"]}>
           <AdminLayout><CreateExam /></AdminLayout>
+        </ProtectedRoute>
+      }/>
+
+      <Route path="/admin/question-library" element={
+        <ProtectedRoute allowedRoles={["admin"]}>
+          <AdminLayout><QuestionLibrary /></AdminLayout>
         </ProtectedRoute>
       }/>
 

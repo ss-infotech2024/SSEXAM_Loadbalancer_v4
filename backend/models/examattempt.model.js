@@ -17,6 +17,10 @@ const examAttemptSchema = new mongoose.Schema({
       type: mongoose.Schema.Types.ObjectId,
       required: true
     },
+    // Copied from the question at submit time so section-wise results survive exam edits
+    section: {
+      type: String
+    },
     userAnswer: {
       type: Number,
       required: true,

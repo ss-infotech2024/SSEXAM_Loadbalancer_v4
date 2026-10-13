@@ -8,6 +8,7 @@ import {
 import API from "@/services/api";
 import { Button, Modal, Badge } from "../../components/ui";
 import { cn } from "../../utils/cn";
+import SectionBreakdown from "../../components/exam/SectionBreakdown";
 
 // Exam requests keep their own timeout (applied per request on the shared API instance)
 const EXAM_REQUEST_TIMEOUT = 30000;
@@ -175,6 +176,7 @@ const ExamInterface = ({ exam, onExamEnd = () => {} }) => {
         wrongCount:      data.wrongCount      ?? data.incorrectCount ?? 0,
         unansweredCount: data.unansweredCount
           ?? (qs.length - (data.correctCount ?? 0) - (data.wrongCount ?? data.incorrectCount ?? 0)),
+        sectionBreakdown: data.sectionBreakdown ?? [],
         // local extras
         subject:          exam?.subject || exam?.title,
         timeTaken,
@@ -334,7 +336,8 @@ const ExamInterface = ({ exam, onExamEnd = () => {} }) => {
     setPhase("fetching");
     setFetchStatus("Fetching exam questions...");
 
-    API.get(`/student/exams/${exam._id}`, { timeout: EXAM_REQUEST_TIMEOUT })
+    let retryTimer;
+    const load = (attempt = 0) => API.get(`/student/exams/${exam._id}`, { timeout: EXAM_REQUEST_TIMEOUT })
       .then((res) => {
         if (!isMountedRef.current) return;
         const data = res.data.exam || res.data.data || res.data;
@@ -352,6 +355,12 @@ const ExamInterface = ({ exam, onExamEnd = () => {} }) => {
       })
       .catch((err) => {
         if (!isMountedRef.current) return;
+        // AI exam: the paper is still being generated (by this or another student's request) → keep trying
+        if (((err.response?.status === 503 && err.response?.data?.retry) || err.code === "ECONNABORTED") && attempt < 45) {
+          setFetchStatus("Preparing your questions, please wait...");
+          retryTimer = setTimeout(() => load(attempt + 1), 4000);
+          return;
+        }
         if (err.response?.status === 401) {
           localStorage.removeItem("token");
           setTimeout(() => navigate("/"), 1500);
@@ -361,6 +370,8 @@ const ExamInterface = ({ exam, onExamEnd = () => {} }) => {
         }
         setPhase("error");
       });
+    load();
+    return () => clearTimeout(retryTimer);
   }, [exam, navigate]);
 
   // ── FIX A: Re-attach camera stream when video DOM node remounts ────────────
@@ -527,6 +538,24 @@ const ExamInterface = ({ exam, onExamEnd = () => {} }) => {
   const timeTone        = timeRemaining < 300 ? "danger" : timeRemaining < 600 ? "warning" : "normal";
   const isMarked        = markedForReview.includes(currentQuestion);
   const examTitle       = exam?.subject || exam?.title || "Exam";
+
+  // Sections are named by the admin per exam. Older exams have none → one unnamed group.
+  const sectionGroups = (() => {
+    const order = [];
+    const byName = {};
+    questions.forEach((q, i) => {
+      const name = q.section || null;
+      if (!(name in byName)) { byName[name] = []; order.push(name); }
+      byName[name].push(i);
+    });
+    return order.map((name) => ({
+      name,
+      indexes: byName[name],
+      answered: byName[name].filter((i) => answers[i] !== undefined).length,
+    }));
+  })();
+  const hasSections    = sectionGroups.some((g) => g.name);
+  const currentSection = currentQ?.section || null;
 
   const toggleMark = () =>
     setMarkedForReview((prev) => prev.includes(currentQuestion) ? prev.filter((i) => i !== currentQuestion) : [...prev, currentQuestion]);
@@ -742,6 +771,8 @@ const ExamInterface = ({ exam, onExamEnd = () => {} }) => {
                 ))}
               </dl>
 
+              <SectionBreakdown breakdown={resultData.sectionBreakdown} className="mt-6 rounded-lg border border-slate-200 px-4 py-4" />
+
               {violationHistory.length > 0 && (
                 <div className="mt-6 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
                   <p className="text-sm font-semibold text-amber-900">Proctoring warnings ({resultData.violations}/{MAX_WARNINGS})</p>
@@ -792,31 +823,43 @@ const ExamInterface = ({ exam, onExamEnd = () => {} }) => {
 
   const questionGrid = (
     <>
-      <div className="grid grid-cols-6 gap-1.5 sm:grid-cols-8 lg:grid-cols-5">
-        {questions.map((_, i) => {
-          const isCurrent = i === currentQuestion;
-          const answered = answers[i] !== undefined;
-          const marked = markedForReview.includes(i);
-          return (
-            <button
-              key={i}
-              type="button"
-              onClick={() => { setCurrentQuestion(i); setShowPalette(false); }}
-              aria-label={`Question ${i + 1}${answered ? ", answered" : ", not answered"}${marked ? ", marked for review" : ""}`}
-              aria-current={isCurrent ? "step" : undefined}
-              className={cn(
-                "relative h-9 rounded-md text-xs font-semibold tabular transition-colors",
-                answered ? "bg-emerald-600 text-white hover:bg-emerald-700"
-                  : marked ? "bg-amber-100 text-amber-900 hover:bg-amber-200"
-                  : "border border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:bg-slate-50",
-                isCurrent && "ring-2 ring-brand-600 ring-offset-2"
-              )}
-            >
-              {i + 1}
-              {marked && <span className="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-white bg-amber-500" aria-hidden="true" />}
-            </button>
-          );
-        })}
+      <div className="space-y-4">
+        {sectionGroups.map((g) => (
+          <div key={g.name || "all"}>
+            {hasSections && (
+              <p className="mb-1.5 flex items-center justify-between text-xs font-semibold text-slate-700">
+                <span>{g.name || "Other"}</span>
+                <span className="font-mono font-normal tabular text-slate-500">{g.answered}/{g.indexes.length}</span>
+              </p>
+            )}
+            <div className="grid grid-cols-6 gap-1.5 sm:grid-cols-8 lg:grid-cols-5">
+              {g.indexes.map((i) => {
+                const isCurrent = i === currentQuestion;
+                const answered = answers[i] !== undefined;
+                const marked = markedForReview.includes(i);
+                return (
+                  <button
+                    key={i}
+                    type="button"
+                    onClick={() => { setCurrentQuestion(i); setShowPalette(false); }}
+                    aria-label={`${g.name ? g.name + ", " : ""}Question ${i + 1}${answered ? ", answered" : ", not answered"}${marked ? ", marked for review" : ""}`}
+                    aria-current={isCurrent ? "step" : undefined}
+                    className={cn(
+                      "relative h-9 rounded-md text-xs font-semibold tabular transition-colors",
+                      answered ? "bg-emerald-600 text-white hover:bg-emerald-700"
+                        : marked ? "bg-amber-100 text-amber-900 hover:bg-amber-200"
+                        : "border border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:bg-slate-50",
+                      isCurrent && "ring-2 ring-brand-600 ring-offset-2"
+                    )}
+                  >
+                    {i + 1}
+                    {marked && <span className="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-white bg-amber-500" aria-hidden="true" />}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        ))}
       </div>
       <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1.5 text-xs text-slate-600">
         <span className="flex items-center gap-1.5"><span className="h-3 w-3 rounded-sm bg-emerald-600" />Answered</span>
@@ -920,10 +963,36 @@ const ExamInterface = ({ exam, onExamEnd = () => {} }) => {
         {/* ── Question area ── */}
         <main className="min-w-0 flex-1 overflow-y-auto px-3 py-5 pb-28 sm:px-6 lg:pb-8">
           <div className="mx-auto max-w-3xl">
+            {hasSections && (
+              <div role="tablist" aria-label="Exam sections" className="mb-4 flex gap-1.5 overflow-x-auto rounded-xl border border-slate-200 bg-white p-1.5">
+                {sectionGroups.map((g) => {
+                  const active = g.name === currentSection;
+                  return (
+                    <button
+                      key={g.name || "other"}
+                      type="button"
+                      role="tab"
+                      aria-selected={active}
+                      onClick={() => setCurrentQuestion(g.indexes.find((i) => answers[i] === undefined) ?? g.indexes[0])}
+                      className={cn(
+                        "flex shrink-0 items-center gap-2 rounded-lg px-3.5 py-2 text-sm font-semibold transition-colors",
+                        active ? "bg-brand-600 text-white shadow-sm" : "text-slate-600 hover:bg-slate-100"
+                      )}
+                    >
+                      {g.name || "Other"}
+                      <span className={cn("rounded-full px-2 py-0.5 font-mono text-[11px] tabular", active ? "bg-white/20 text-white" : "bg-slate-100 text-slate-600")}>
+                        {g.answered}/{g.indexes.length}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
             <article className="card p-5 sm:p-7" aria-labelledby="question-text">
               <div className="mb-5 flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2">
                   <span className="rounded-md bg-slate-900 px-2.5 py-1 font-mono text-xs font-bold text-white">Q{currentQuestion + 1}</span>
+                  {currentSection && <span className="rounded-md bg-brand-50 px-2 py-1 text-xs font-semibold text-brand-700">{currentSection}</span>}
                   <span className="text-xs font-medium text-slate-500">{marksPerQ} mark{marksPerQ > 1 ? "s" : ""}</span>
                 </div>
                 <button

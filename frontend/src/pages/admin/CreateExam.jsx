@@ -9,13 +9,17 @@ import {
   clearActionError,
 } from "../../store/slices/examSlices";
 import {
-  PencilLine, UploadCloud, Download, FileSpreadsheet, Plus, ListPlus, ArrowLeft, ArrowRight, Check,
+  PencilLine, UploadCloud, Sparkles, Download, FileSpreadsheet, Plus, ListPlus, ArrowLeft, ArrowRight, Check,
   Building2, Star, CalendarClock, Trash2, X, ListChecks,
 } from "lucide-react";
 import CameraProctoringToggle from "../../components/exam/CameraProctoringToggle";
 import ShuffleQuestionsToggle from "../../components/exam/ShuffleQuestionsToggle";
 import ExamDetailsFields from "../../components/exam/ExamDetailsFields";
 import QuestionEditorCard from "../../components/exam/QuestionEditorCard";
+import SectionPicker from "../../components/exam/SectionPicker";
+import SectionManager from "../../components/exam/SectionManager";
+import ExamLibraryTools from "../../components/library/ExamLibraryTools";
+import { DEFAULT_SECTIONS, sectionsFromQuestions, applySectionChange, sortBySection, countBySection, sectionErrors } from "../../utils/sections";
 import {
   PageHeader, Button, Card, CardHeader, Tabs, Badge, Alert, EmptyState, ConfirmDialog, useToast,
 } from "../../components/ui";
@@ -26,7 +30,11 @@ import { loadDraft, saveDraft, clearDraft } from "../../utils/examDraft";
 // ─── Constants ────────────────────────────────────────────────────────────────
 const EMPTY_EXAM    = { subject: "", duration: "", startTime: "", endTime: "", marksPerQuestion: "", cameraEnabled: true, shuffleQuestions: false };
 const MARKS_OPTIONS = [1, 2, 3, 4, 5];
-const makeQuestion  = () => ({ id: Date.now() + Math.random(), text: "", options: ["", "", "", ""], correctAnswer: null });
+const EMPTY_PART    = { topic: "", count: 5, difficulty: "medium" };
+const EMPTY_AI      = { language: "English", parts: [{ ...EMPTY_PART }] };
+const AI_MAX_PARTS  = 8;
+const AI_MAX_TOTAL  = 60;
+const makeQuestion  = (section = null) => ({ id: Date.now() + Math.random(), section, text: "", options: ["", "", "", ""], correctAnswer: null });
 
 // ─── Helper: extract user-friendly message from rejected thunk payload ─────────
 const getErrorMessage = (payload) => {
@@ -114,7 +122,7 @@ const ExcelPanel = ({ onSuccess, showToast }) => {
           <ol className="space-y-4">
             {[
               ["Download the template", "The .xlsx template has the exact columns the server expects."],
-              ["Fill in both sheets", "Add exam info on the Exam Info sheet and one row per question on Questions."],
+              ["Fill in both sheets", "Add exam info on the Exam Info sheet and one row per question on Questions. Type any section names you like in the Section column — leave it empty for no sections."],
               ["Upload the file", "The exam is created immediately. Any row errors are listed so you can fix them."],
             ].map(([title, text], i) => (
               <li key={title} className="flex gap-3">
@@ -246,8 +254,10 @@ const CreateExam = () => {
   const showToast = useToast();
   const { actionLoading, actionError } = useSelector((s) => s.exams);
 
-  // "manual" | "excel"
+  // "manual" | "excel" | "ai"
   const [mode, setMode] = useState("manual");
+  // "ai": the admin only describes the paper; the server generates the questions once, when needed
+  const [ai, setAi] = useState(EMPTY_AI);
 
   const [draft] = useState(loadDraft);
 
@@ -264,7 +274,11 @@ const CreateExam = () => {
   const [step,      setStep]      = useState(draft?.step ?? 1);
   const [examData,  setExamData]  = useState(draft?.examData ?? EMPTY_EXAM);
   const [questions, setQuestions] = useState(draft?.questions ?? []);
+  // Admin-defined section names. New exams start from the defaults; drafts keep their own.
+  const [sections,  setSections]  = useState(draft ? (draft.sections ?? sectionsFromQuestions(draft.questions)) : DEFAULT_SECTIONS);
   const [errors,    setErrors]    = useState({});
+  const [activeSection, setActiveSection] = useState(null); // where "Add question" puts new ones
+  const activeName = sections.includes(activeSection) ? activeSection : (sections[0] ?? null);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
 
   useEffect(() => {
@@ -288,8 +302,8 @@ const CreateExam = () => {
   }, [actionError, showToast]);
 
   useEffect(() => {
-    saveDraft({ step, examData, questions });
-  }, [step, examData, questions]);
+    saveDraft({ step, examData, questions, sections });
+  }, [step, examData, questions, sections]);
 
   // ── Step 1 handlers ────────────────────────────────────────────────────────
   const handleInfoChange = (e) => {
@@ -319,20 +333,77 @@ const CreateExam = () => {
     return Object.keys(e).length === 0;
   };
 
+  const setPart = (i, patch) => {
+    setAi((p) => ({ ...p, parts: p.parts.map((x, j) => (j === i ? { ...x, ...patch } : x)) }));
+    setErrors((p) => ({ ...p, aiParts: "" }));
+  };
+  const aiTotal = ai.parts.reduce((n, p) => n + (parseInt(p.count, 10) || 0), 0);
+
+  const handleCreateAi = async () => {
+    if (!validateStep1()) { showToast("Fix the errors in the exam details.", "error"); return; }
+    let msg = "";
+    const names = new Set();
+    ai.parts.forEach((p, i) => {
+      const n = parseInt(p.count, 10), name = p.topic.trim().replace(/\s+/g, " ").toLowerCase();
+      if (!msg && !name)                 msg = `Topic ${i + 1}: enter a topic`;
+      else if (!msg && names.has(name))  msg = `Topic "${p.topic.trim()}" is listed twice`;
+      else if (!msg && !(n >= 1 && n <= 20)) msg = `Topic ${i + 1}: choose 1–20 questions`;
+      names.add(name);
+    });
+    if (!msg && aiTotal > AI_MAX_TOTAL) msg = `At most ${AI_MAX_TOTAL} AI questions per exam (you have ${aiTotal})`;
+    if (msg) { setErrors((p) => ({ ...p, aiParts: msg })); return; }
+
+    const res = await dispatch(createExam({
+      subject:          examData.subject.trim(),
+      duration:         Number(examData.duration),
+      startTime:        localToIST_ISO(examData.startTime),
+      endTime:          localToIST_ISO(examData.endTime),
+      marksPerQuestion: Number(examData.marksPerQuestion),
+      cameraEnabled:    examData.cameraEnabled !== false,
+      shuffleQuestions: examData.shuffleQuestions === true,
+      aiConfig: {
+        enabled: true,
+        language: ai.language.trim() || "English",
+        parts: ai.parts.map((p) => ({ topic: p.topic.trim(), count: parseInt(p.count, 10), difficulty: p.difficulty })),
+      },
+    }));
+    if (res.meta.requestStatus === "fulfilled") {
+      showToast(`Exam "${examData.subject}" created. ${aiTotal} AI questions will be generated for the students.`, "success");
+      setExamData(EMPTY_EXAM);
+      setAi(EMPTY_AI);
+      setErrors({});
+      navigate("/admin/exams");
+    }
+  };
+
   const goToStep = (n) => {
     if (n === 1) setStep(1);
     else if (validateStep1()) setStep(2);
   };
 
   // ── Step 2 handlers ────────────────────────────────────────────────────────
+  const handleSectionsChange = (change) => {
+    setSections(change.sections);
+    if (change.rename) {
+      setQuestions((p) => applySectionChange(p, change));
+      if (change.rename.from === activeSection) setActiveSection(change.rename.to);
+    }
+    // old "choose a section" errors may no longer apply
+    setErrors((p) => Object.fromEntries(Object.entries(p).filter(([k]) => !k.endsWith("-section"))));
+  };
+
   const addQuestion = () => {
-    const q = makeQuestion();
+    const q = makeQuestion(activeName);
     setQuestions((p) => [...p, q]);
     setTimeout(() => questionRefs.current[questions.length]?.focus(), 80);
   };
 
+  // Questions coming from the library / AI: filled in, placed in the section being worked on
+  const addImported = (list) =>
+    setQuestions((p) => [...p, ...list.map((q) => ({ ...makeQuestion(activeName), text: q.text, options: q.options, correctAnswer: q.correctAnswer }))]);
+
   const addTenQuestions = () => {
-    setQuestions((p) => [...p, ...Array.from({ length: 10 }, makeQuestion)]);
+    setQuestions((p) => [...p, ...Array.from({ length: 10 }, () => makeQuestion(activeName))]);
     setTimeout(() => questionRefs.current[questions.length]?.focus(), 80);
   };
 
@@ -343,6 +414,7 @@ const CreateExam = () => {
       p.map((q) => {
         if (q.id !== id) return q;
         if (field === "text")          return { ...q, text: value };
+        if (field === "section")       return { ...q, section: value };
         if (field === "option")        { const opts = [...q.options]; opts[optIdx] = value; return { ...q, options: opts }; }
         if (field === "correctAnswer") return { ...q, correctAnswer: parseInt(value, 10) };
         return q;
@@ -361,6 +433,7 @@ const CreateExam = () => {
       });
       if (q.correctAnswer === null) e[`q-${q.id}-correct`] = "Select the correct answer";
     });
+    Object.assign(e, sectionErrors(questions, sections));
     setErrors(e);
     return Object.keys(e).length === 0;
   };
@@ -378,7 +451,9 @@ const CreateExam = () => {
       marksPerQuestion: Number(examData.marksPerQuestion),
       cameraEnabled:    examData.cameraEnabled !== false,
       shuffleQuestions: examData.shuffleQuestions === true,
-      questions: questions.map((q) => ({
+      sections,
+      questions: sortBySection(questions, sections).map((q) => ({
+        section:       q.section || undefined,
         text:          q.text.trim(),
         options:       q.options.map((o) => o.trim()),
         correctAnswer: q.correctAnswer,
@@ -393,6 +468,7 @@ const CreateExam = () => {
       );
       setExamData(EMPTY_EXAM);
       setQuestions([]);
+      setSections(DEFAULT_SECTIONS);
       setStep(1);
       setErrors({});
       clearDraft();
@@ -402,6 +478,7 @@ const CreateExam = () => {
   const handleDiscardDraft = () => {
     setExamData(EMPTY_EXAM);
     setQuestions([]);
+    setSections(DEFAULT_SECTIONS);
     setStep(1);
     setErrors({});
     clearDraft();
@@ -416,6 +493,7 @@ const CreateExam = () => {
 
   const totalMarks      = questions.length * (Number(examData.marksPerQuestion) || 0);
   const hasDraftContent = examData.subject || questions.length > 0;
+  const sectionCounts   = countBySection(questions, sections);
   const answeredCount   = questions.filter((q) => q.correctAnswer !== null).length;
   const customMarks     = examData.marksPerQuestion && !MARKS_OPTIONS.includes(examData.marksPerQuestion);
 
@@ -440,7 +518,8 @@ const CreateExam = () => {
         className="mb-6"
         items={[
           { value: "manual", label: "Manual entry", icon: PencilLine },
-          { value: "excel",  label: "Upload Excel", icon: UploadCloud },
+          // { value: "excel",  label: "Upload Excel", icon: UploadCloud },
+          // { value: "ai",     label: "AI generated", icon: Sparkles },
         ]}
       />
 
@@ -450,7 +529,7 @@ const CreateExam = () => {
       {mode === "manual" && <Steps step={step} questionCount={questions.length} onStep={goToStep} />}
 
       {/* ══ MANUAL MODE — STEP 1 ════════════════════════════════════════════ */}
-      {mode === "manual" && step === 1 && (
+      {(mode === "manual" || mode === "ai") && step === 1 && (
         <div className="space-y-6">
           <Card>
             <CardHeader title="Exam details" description="Name, length and the window in which students can start." icon={CalendarClock} />
@@ -526,9 +605,63 @@ const CreateExam = () => {
             </div>
           </Card>
 
-          <div className="flex justify-end">
-            <Button size="lg" iconRight={ArrowRight} onClick={() => goToStep(2)}>Continue to questions</Button>
-          </div>
+          {mode === "ai" ? (
+            <>
+              <Card>
+                <CardHeader title="AI questions" description="Add one row per topic. Each topic becomes its own section with the number of questions you set. Generated once; every student gets the same paper." icon={Sparkles} />
+                <div className="card-body space-y-3">
+                  {ai.parts.map((p, i) => (
+                    <div key={i} className="grid grid-cols-1 gap-2 rounded-lg border border-slate-200 p-3 sm:grid-cols-[1fr_7rem_8rem_auto] sm:items-end">
+                      <div>
+                        <label className="label" htmlFor={`ai-topic-${i}`}>Topic / section {i + 1}</label>
+                        <input id={`ai-topic-${i}`} className="input" maxLength={50} placeholder="e.g. Java collections"
+                          value={p.topic} onChange={(e) => setPart(i, { topic: e.target.value })} />
+                      </div>
+                      <div>
+                        <label className="label" htmlFor={`ai-count-${i}`}>Questions</label>
+                        <input id={`ai-count-${i}`} type="number" min="1" max="20" className="input"
+                          value={p.count} onChange={(e) => setPart(i, { count: e.target.value })} />
+                      </div>
+                      <div>
+                        <label className="label" htmlFor={`ai-diff-${i}`}>Difficulty</label>
+                        <select id={`ai-diff-${i}`} className="input" value={p.difficulty} onChange={(e) => setPart(i, { difficulty: e.target.value })}>
+                          <option value="easy">Easy</option><option value="medium">Medium</option><option value="hard">Hard</option>
+                        </select>
+                      </div>
+                      <Button variant="ghost" icon={Trash2} disabled={ai.parts.length === 1} aria-label={`Remove topic ${i + 1}`}
+                        onClick={() => setAi((x) => ({ ...x, parts: x.parts.filter((_, j) => j !== i) }))} />
+                    </div>
+                  ))}
+                  {errors.aiParts && <p className="field-error">{errors.aiParts}</p>}
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <Button variant="secondary" icon={Plus} disabled={ai.parts.length >= AI_MAX_PARTS}
+                      onClick={() => setAi((x) => ({ ...x, parts: [...x.parts, { ...EMPTY_PART }] }))}>Add topic</Button>
+                    <p className="text-sm text-slate-600">
+                      Total: <strong className="text-slate-900">{aiTotal}</strong> questions
+                      {examData.marksPerQuestion ? <> = <strong className="text-slate-900">{aiTotal * Number(examData.marksPerQuestion)}</strong> marks</> : null}
+                    </p>
+                  </div>
+                  <div className="max-w-xs">
+                    <label className="label" htmlFor="ai-lang">Language</label>
+                    <input id="ai-lang" className="input" maxLength={30} value={ai.language} onChange={(e) => setAi((p) => ({ ...p, language: e.target.value }))} />
+                  </div>
+                </div>
+              </Card>
+              <Alert tone="info" icon={Sparkles}>
+                Questions are generated when the first student opens the exam, or earlier if you press <strong>Generate now</strong> in Edit exam to review them.
+                AI can make mistakes — reviewing the paper before the exam is recommended.
+              </Alert>
+              <div className="flex justify-end">
+                <Button size="lg" icon={Check} onClick={handleCreateAi} loading={actionLoading}>
+                  {actionLoading ? "Creating…" : "Create AI exam"}
+                </Button>
+              </div>
+            </>
+          ) : (
+            <div className="flex justify-end">
+              <Button size="lg" iconRight={ArrowRight} onClick={() => goToStep(2)}>Continue to questions</Button>
+            </div>
+          )}
         </div>
       )}
 
@@ -552,9 +685,18 @@ const CreateExam = () => {
             </dl>
           </Card>
 
+          <SectionManager sections={sections} counts={sectionCounts} onChange={handleSectionsChange} />
+
+          {sections.length > 0 && (
+            <Card className="p-4">
+              <SectionPicker sections={sections} active={activeName} counts={sectionCounts} onChange={setActiveSection} />
+            </Card>
+          )}
+
           <div className="flex flex-wrap items-center justify-between gap-3 pt-2">
             <h2 className="text-base font-semibold text-slate-900">Questions</h2>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
+              <ExamLibraryTools questions={questions} sectionName={activeName} subject={examData.subject} onAdd={addImported} />
               <Button variant="secondary" icon={Plus} onClick={addQuestion}>Add question</Button>
               <Button variant="secondary" icon={ListPlus} onClick={addTenQuestions}>Add 10</Button>
             </div>
@@ -580,6 +722,7 @@ const CreateExam = () => {
                 key={q.id}
                 index={index}
                 question={q}
+                sections={sections}
                 marks={examData.marksPerQuestion}
                 errors={errors}
                 inputRef={(el) => (questionRefs.current[index] = el)}

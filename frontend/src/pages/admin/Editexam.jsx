@@ -8,17 +8,22 @@ import CameraProctoringToggle from "../../components/exam/CameraProctoringToggle
 import ShuffleQuestionsToggle from "../../components/exam/ShuffleQuestionsToggle";
 import ExamDetailsFields from "../../components/exam/ExamDetailsFields";
 import QuestionEditorCard from "../../components/exam/QuestionEditorCard";
+import SectionPicker from "../../components/exam/SectionPicker";
+import SectionManager from "../../components/exam/SectionManager";
+import ExamLibraryTools from "../../components/library/ExamLibraryTools";
+import { sectionsFromQuestions, resolveSection, applySectionChange, sortBySection, countBySection, sectionErrors } from "../../utils/sections";
 import {
-  ArrowLeft, Save, Plus, ListPlus, Lock, CalendarClock, ShieldCheck, Building2, Info, FileSpreadsheet, Download,
+  ArrowLeft, Save, Plus, ListPlus, Lock, CalendarClock, ShieldCheck, Building2, Info, FileSpreadsheet, Download, Sparkles,
 } from "lucide-react";
 import {
   PageHeader, Button, Card, CardHeader, Badge, Alert, EmptyState, ErrorState, LoadingState, Modal, useToast,
 } from "../../components/ui";
 import { isoToLocalInput, localToIST_ISO } from "../../utils/time";
 
-const makeQuestion = () => ({
+const makeQuestion = (section = null) => ({
   _id: null,
   id:            Date.now() + Math.random(),
+  section,
   text:          "",
   options:       ["", "", "", ""],
   correctAnswer: null,
@@ -86,9 +91,12 @@ const toFormState = (selected) => ({
     shuffleQuestions: selected.shuffleQuestions === true, // older exams have no field → OFF
   },
   marksPerQuestion: selected.marksPerQuestion ?? 1,
+  // Older exams have no saved section list → use the names their questions already carry
+  sections: selected.sections?.length ? [...selected.sections] : sectionsFromQuestions(selected.questions),
   questions: (selected.questions || []).map((q) => ({
     _id:           q._id,
     id:            q._id || Date.now() + Math.random(),
+    section:       q.section || null, // older exams have no sections
     text:          q.text,
     options:       [...q.options],
     correctAnswer: q.correctAnswer,
@@ -115,11 +123,33 @@ const EditExam = () => {
   const [examData,         setExamData]         = useState({ subject: "", duration: "", startTime: "", endTime: "", cameraEnabled: true });
   const [marksPerQuestion, setMarksPerQuestion] = useState(null); // read-only after fetch
   const [questions,        setQuestions]        = useState([]);
+  const [sections,         setSections]         = useState([]);   // admin-defined, in display order
   const [errors,           setErrors]           = useState({});
   const [loadedId,         setLoadedId]         = useState(null);
+  const [activeSection,    setActiveSection]    = useState(null); // where "Add question" puts new ones
+  const activeName = sections.includes(activeSection) ? activeSection : (sections[0] ?? null);
 
   const [importing,        setImporting]        = useState(false);
   const [importResult,     setImportResult]     = useState(null); // { fileName, questions } | { error }
+
+  const aiExam = selected?.aiConfig?.enabled === true;
+  const [aiBusy, setAiBusy] = useState(false);
+
+  // Admin generates (or regenerates) the AI paper early so it can be reviewed before students see it
+  const handleGenerateAi = async () => {
+    if (questions.length > 0 && !window.confirm("This replaces the current questions with a new AI-generated set. Continue?")) return;
+    setAiBusy(true);
+    try {
+      await API.post(`/admin/exams/${id}/ai-generate`, {}, { timeout: 90000 });
+      setLoadedId(null);               // re-fill the form from the fresh exam
+      await dispatch(fetchExamById(id));
+      showToast("AI questions generated. Review them below.", "success");
+    } catch (err) {
+      showToast(err.response?.data?.message || "Could not generate questions.", "error");
+    } finally {
+      setAiBusy(false);
+    }
+  };
 
   const questionRefs = useRef([]);
   const fileInputRef = useRef(null);
@@ -141,6 +171,7 @@ const EditExam = () => {
     setExamData(s.examData);
     setMarksPerQuestion(s.marksPerQuestion);
     setQuestions(s.questions);
+    setSections(s.sections);
   }
 
   // ── Handlers ───────────────────────────────────────────────────────────────
@@ -150,14 +181,28 @@ const EditExam = () => {
     if (errors[name]) setErrors((p) => ({ ...p, [name]: "" }));
   };
 
+  const handleSectionsChange = (change) => {
+    setSections(change.sections);
+    if (change.rename) {
+      setQuestions((p) => applySectionChange(p, change));
+      if (change.rename.from === activeSection) setActiveSection(change.rename.to);
+    }
+    // old "choose a section" errors may no longer apply
+    setErrors((p) => Object.fromEntries(Object.entries(p).filter(([k]) => !k.endsWith("-section"))));
+  };
+
   const addQuestion = () => {
-    const q = makeQuestion();
+    const q = makeQuestion(activeName);
     setQuestions((p) => [...p, q]);
     setTimeout(() => questionRefs.current[questions.length]?.focus(), 80);
   };
 
+  // Questions coming from the library / AI: filled in, placed in the section being worked on
+  const addImported = (list) =>
+    setQuestions((p) => [...p, ...list.map((q) => ({ ...makeQuestion(activeName), text: q.text, options: q.options, correctAnswer: q.correctAnswer }))]);
+
   const addTenQuestions = () => {
-    setQuestions((p) => [...p, ...Array.from({ length: 10 }, makeQuestion)]);
+    setQuestions((p) => [...p, ...Array.from({ length: 10 }, () => makeQuestion(activeName))]);
   };
 
   const removeQuestion = (lid) => setQuestions((p) => p.filter((q) => q.id !== lid));
@@ -177,7 +222,7 @@ const EditExam = () => {
       const fd = new FormData();
       fd.append("examFile", file);
       const res = await API.post("/admin/exams/questions/parse", fd);
-      setImportResult({ fileName: file.name, questions: res.data.questions || [] });
+      setImportResult({ fileName: file.name, questions: res.data.questions || [], sections: res.data.sections || [] });
     } catch (err) {
       const data = err.response?.data;
       setImportResult({
@@ -192,13 +237,19 @@ const EditExam = () => {
   };
 
   const applyImport = (mode) => {
+    // Section names come from the Excel file: reuse this exam's spelling when a name matches,
+    // otherwise add it to the exam's sections.
+    const merged = [...sections];
+    (importResult.sections || []).forEach((name) => { if (!resolveSection(name, merged)) merged.push(name); });
     const imported = importResult.questions.map((q) => ({
       _id:           null,
       id:            Date.now() + Math.random(),
+      section:       resolveSection(q.section, merged) || activeName, // blank in the file → the section being filled
       text:          q.text,
       options:       [...q.options],
       correctAnswer: q.correctAnswer,
     }));
+    setSections(merged);
     setQuestions((p) => (mode === "replace" ? imported : [...p, ...imported]));
     setErrors((p) => Object.fromEntries(Object.entries(p).filter(([k]) => !k.startsWith("q-"))));
     setImportResult(null);
@@ -218,6 +269,7 @@ const EditExam = () => {
       p.map((q) => {
         if (q.id !== lid) return q;
         if (field === "text")          return { ...q, text: value };
+        if (field === "section")       return { ...q, section: value };
         if (field === "option") {
           const opts = [...q.options];
           opts[optIdx] = value;
@@ -250,13 +302,15 @@ const EditExam = () => {
       });
       if (q.correctAnswer === null) e[`q-${q.id}-correct`] = "Select the correct answer";
     });
+    Object.assign(e, sectionErrors(questions, sections));
     setErrors(e);
     return Object.keys(e).length === 0;
   };
 
   // ── Save ───────────────────────────────────────────────────────────────────
   const handleSave = async () => {
-    if (questions.length === 0) { showToast("Add at least one question.", "error"); return; }
+    const awaitingAi = aiExam && questions.length === 0;   // AI paper not generated yet — fine, the server will do it
+    if (questions.length === 0 && !awaitingAi) { showToast("Add at least one question.", "error"); return; }
     if (!validate())            { showToast("Fix the errors before saving.", "error"); return; }
 
     const payload = {
@@ -268,11 +322,15 @@ const EditExam = () => {
       // marksPerQuestion intentionally NOT sent — backend ignores it on update
       cameraEnabled: examData.cameraEnabled !== false,
       shuffleQuestions: examData.shuffleQuestions === true,
-      questions: questions.map((q) => ({
-        text:          q.text.trim(),
-        options:       q.options.map((o) => o.trim()),
-        correctAnswer: q.correctAnswer,
-      })),
+      sections,
+      ...(awaitingAi ? {} : {
+        questions: sortBySection(questions, sections).map((q) => ({
+          section:       q.section || undefined,
+          text:          q.text.trim(),
+          options:       q.options.map((o) => o.trim()),
+          correctAnswer: q.correctAnswer,
+        })),
+      }),
     };
 
     const res = await dispatch(updateExam({ id, body: payload }));
@@ -369,10 +427,36 @@ const EditExam = () => {
                 className="hidden"
                 onChange={handleExcelFile}
               />
+              <ExamLibraryTools questions={questions} sectionName={activeName} subject={examData.subject} onAdd={addImported} />
               <Button variant="secondary" icon={Plus} onClick={addQuestion}>Add question</Button>
               <Button variant="secondary" icon={ListPlus} onClick={addTenQuestions}>Add 10</Button>
             </div>
           </div>
+
+          {aiExam && (
+            <Alert tone="info" icon={Sparkles}>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <span>
+                  AI exam — {(selected.aiConfig.parts || []).map((p) => `${p.topic}: ${p.count} (${p.difficulty})`).join(" · ")}.{" "}
+                  {questions.length === 0
+                    ? "Not generated yet; it is created automatically when the first student opens the exam."
+                    : "Review the questions below; AI can make mistakes."}
+                  {selected.aiConfig.status === "failed" && selected.aiConfig.error ? ` Last attempt failed: ${selected.aiConfig.error}` : ""}
+                </span>
+                <Button size="sm" variant="secondary" icon={Sparkles} loading={aiBusy} onClick={handleGenerateAi}>
+                  {questions.length === 0 ? "Generate now" : "Regenerate"}
+                </Button>
+              </div>
+            </Alert>
+          )}
+
+          <SectionManager sections={sections} counts={countBySection(questions, sections)} onChange={handleSectionsChange} />
+
+          {sections.length > 0 && (
+            <Card className="p-4">
+              <SectionPicker sections={sections} active={activeName} counts={countBySection(questions, sections)} onChange={setActiveSection} />
+            </Card>
+          )}
 
           <Alert tone="info" icon={Info}>Saving replaces the full question set with what you see below.</Alert>
 
@@ -390,6 +474,7 @@ const EditExam = () => {
                 key={q.id}
                 index={index}
                 question={q}
+                sections={sections}
                 marks={marksPerQuestion}
                 errors={errors}
                 inputRef={(el) => (questionRefs.current[index] = el)}
